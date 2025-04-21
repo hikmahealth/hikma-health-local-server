@@ -21,6 +21,13 @@
       "csp": null
     }
   },
+  "plugins": {
+    "sql": {
+      "preload": [
+        "sqlite:hikma-health.db"
+      ]
+    }
+  },
   "bundle": {
     "active": true,
     "targets": "all",

@@ -2,5 +2,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    hikma_health_local_server_lib::run()
+    hikma_health_local_server_lib::run();
 }

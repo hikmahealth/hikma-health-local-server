@@ -1,0 +1,6 @@
+hikma-health.db
+**/hikma-health.db
+hikma-health.db-shm
+**/hikma-health.db-shm
+hikma-health.db-wal
+**/hikma-health.db-wal

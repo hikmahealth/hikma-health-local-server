@@ -1,32 +1,30 @@
 use local_ip_address::local_ip;
+use migrations::HH_MIGRATIONS;
 use once_cell::sync::Lazy;
 use poem::{
+    error::{ExpectationFailed, InternalServerError},
     get, handler,
     listener::TcpListener,
     post,
     web::{Json, Path, Query},
-    Error, IntoResponse, Result, Route, Server,
-};
-use polodb_core::{
-    bson::{doc, Document},
-    CollectionT, Database,
+    IntoResponse, Result, Route, Server,
 };
 use serde::{Deserialize, Serialize};
-use serde_json;
+use serde_json::{self, json};
+use sqlx::sqlite::SqlitePool;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{collections::HashMap, net::IpAddr};
+use tauri::State;
 use tauri_plugin_fs::FsExt;
+use tauri_plugin_sql::{Builder, DbInstances, DbPool, Migration, MigrationKind};
 
-// Lazily initialize the database instance
-static DB: Lazy<Database> = Lazy::new(|| {
-    println!("Initializing database connection...");
+use futures::future::try_join_all;
 
-    // Use a relative path for simplicity for now
-    let db_path = "hikma-health.db";
-    // Open the database
-    Database::open_path(db_path).expect("Failed to open database")
-});
+#[path = "util/db.rs"]
+mod db;
+
+mod migrations;
 
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 #[tauri::command]
@@ -63,7 +61,7 @@ pub struct RawRecord {
 pub struct SyncTableChangeSet {
     pub created: Vec<RawRecord>,
     pub updated: Vec<RawRecord>,
-    pub deleted: Vec<RawRecord>,
+    pub deleted: Vec<String>, // List of IDs to delete
 }
 
 /// Represents changes to the entire database, organized by table name
@@ -139,6 +137,16 @@ impl SyncTableChangeSet {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LocalDBEntry {
+    id: String,
+    created_at: i64,
+    updated_at: i64,
+    local_server_created_at: i64,
+    local_server_last_modified: i64,
+    data: HashMap<String, serde_json::Value>, // This is stored as a JSON object
+}
+
 // Tables sent from the syncing clients include:
 // is it possible to make collections on the fly if they dont exist?
 // TODO: @ally consider how this could work.
@@ -165,11 +173,17 @@ fn get_sync(Query(params): Query<HashMap<String, String>>) -> Result<impl IntoRe
 
     // Create empty response in a functional way
     let changes: SyncDatabaseChangeSet = SyncDatabaseChangeSet(HashMap::new());
+
+    println!(
+        "GET sync response: {}",
+        serde_json::to_string_pretty(&changes)
+            .unwrap_or_else(|_| "Failed to serialize changes".to_string())
+    );
     Ok(Json(changes))
 }
 
 #[handler]
-fn post_sync(
+async fn post_sync(
     Json(body): Json<SyncDatabaseChangeSet>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<impl IntoResponse> {
@@ -183,29 +197,154 @@ fn post_sync(
         .map(|timestamp| println!("POST sync request with lastPulledAt: {}", timestamp))
         .unwrap_or_else(|| println!("POST sync request with no lastPulledAt parameter"));
 
+    println!(
+        "Last Pulled At: {}",
+        params.get("lastPulledAt").unwrap_or(&"0".to_string())
+    );
+
+    let db_url = db::get_database();
+
+    println!("Database URL: {}", db_url);
+
+    let db_pool = match SqlitePool::connect(&db_url).await {
+        Ok(pool) => pool,
+        Err(err) => return Err(InternalServerError(err)),
+    };
     // Count the changes in each table
-    let table_changes: HashMap<String, (usize, usize)> = body
+    let table_futures = body
         .0
         .iter()
         .map(|(table, changeset)| {
-            println!("Table: {}", table);
-            println!("Updated: {:#?}", changeset.updated);
+            let table = table.clone();
+            let db_pool = db_pool.clone();
+            
+            async move {
+                println!("Table: {}", table);
+                println!("Updated: {:#?}", changeset.updated);
 
-            // Process updates using upserts for the table
-            let updates_result = process_updates(table, &changeset.updated);
-            if let Err(e) = updates_result {
-                eprintln!("Error processing updates for table {}: {}", table, e);
+                // If there are records in the created field, join them with the updated records
+                let updated_records = changeset
+                    .created
+                    .iter()
+                    .chain(changeset.updated.iter())
+                    .map(|rec| record_to_local_db_entry(rec))
+                    .collect::<Vec<LocalDBEntry>>();
+
+                // Process updates/inserts using upserts for the table
+                for entry in &updated_records {
+                    // Serialize the data field to a JSON string
+                    let data_json = match serde_json::to_string(&entry.data) {
+                        Ok(json) => json,
+                        Err(e) => {
+                            eprintln!(
+                                "Failed to serialize data for ID {} in table {}: {}",
+                                entry.id, table, e
+                            );
+                            return Err(InternalServerError(e));
+                        }
+                    };
+
+                    // Construct the dynamic SQL query for upsert
+                    let sql = format!(
+                        r#"
+                        INSERT INTO "{}" (id, data, local_server_created_at, local_server_last_modified)
+                        VALUES (?, ?, ?, ?)
+                        ON CONFLICT(id) DO UPDATE SET
+                            data = excluded.data,
+                            local_server_last_modified = excluded.local_server_last_modified
+                        WHERE excluded.local_server_last_modified > "{}" .local_server_last_modified;
+                        "#,
+                        table, table
+                    );
+
+                    // Block on the async execution for simplicity in the map closure
+                    let query_result = 
+                        sqlx::query(&sql)
+                            .bind(&entry.id)
+                            .bind(&data_json)
+                            .bind(entry.local_server_created_at)
+                            .bind(entry.local_server_last_modified)
+                            .execute(&db_pool) // Use the pool cloned earlier in the handler
+                            .await;
+
+                    match query_result {
+                        Ok(_) => {} // Successfully upserted
+                        Err(e) => {
+                            // Log the error and return an error to stop processing this table
+                            eprintln!(
+                                "Failed to upsert record with ID {} in table {}: {}",
+                                entry.id, table, e
+                            );
+                            return Err(InternalServerError(e));
+                        }
+                    }
+                }
+
+                // Process deletes (soft delete)
+                let current_time = timestamp(); // Get timestamp once for all deletions in this table
+                for deleted_id in &changeset.deleted {
+                    // Construct the dynamic SQL query for soft delete
+                    let sql_delete = format!(
+                        r#"
+                         UPDATE "{}"
+                         SET
+                             local_server_last_modified = ?,
+                             local_server_deleted_at = ?
+                         WHERE id = ? AND local_server_deleted_at IS NULL;
+                         "#,
+                        table
+                    );
+
+                    // Block on the async execution for simplicity
+                    let delete_result = 
+                        sqlx::query(&sql_delete)
+                            .bind(current_time)
+                            .bind(current_time) // Set deleted_at to the same timestamp
+                            .bind(deleted_id)
+                            .execute(&db_pool)
+                            .await;
+
+                     match delete_result {
+                         Ok(result) => {
+                             if result.rows_affected() == 0 {
+                                // Optionally log if the record wasn't found or was already deleted
+                                println!("Record with ID {} in table {} not found for deletion or already deleted.", deleted_id, table);
+                             }
+                         }
+                         Err(e) => {
+                             // Log the error and return an error to stop processing this table
+                             eprintln!(
+                                 "Failed to soft-delete record with ID {} in table {}: {}",
+                                 deleted_id, table, e
+                             );
+                             return Err(InternalServerError(e));
+                         }
+                     }
+                }
+
+                // Process the updated and deleted records for this table
+                let mut update_count = 0;
+                let mut delete_count = 0;
+
+                if !changeset.updated.is_empty() {
+                    update_count = changeset.updated.len();
+                }
+
+                if !changeset.deleted.is_empty() {
+                    delete_count = changeset.deleted.len();
+                }
+
+                Ok((table.clone(), (update_count, delete_count)))
             }
-
-            // Process deletes
-            // TODO: implement
-
-            (
-                table.clone(),
-                (changeset.updated.len(), changeset.deleted.len()),
-            )
         })
-        .collect();
+        .collect::<Vec<_>>();
+    // .collect::<Result<HashMap<String, (usize, usize)>, poem::Error>>()?;
+
+    // Execute all futures in parallel and collect the results
+    let table_changes = try_join_all(table_futures).await?
+        .into_iter()
+        .collect::<HashMap<String, (usize, usize)>>();
+
 
     // Calculate totals
     let update_count: usize = table_changes.values().map(|(updates, _)| updates).sum();
@@ -232,94 +371,22 @@ fn post_sync(
     Ok(Json(SyncDatabaseChangeSet::new()))
 }
 
-fn process_updates(table_name: &str, records: &[RawRecord]) -> Result<(), String> {
-    if records.is_empty() {
-        return Ok(());
-    }
-
-    // first we get or create the collection
-    let collection = DB.collection::<Document>(table_name);
-
-    // then we process the updates
-    records.iter().try_for_each(|record| {
-        // convert into doc for polodb
-        let doc = record_to_document(record)?;
-
-        // first find existing record by ID
-        let filter = doc! { "id": &record.id };
-
-        // upsert the record with update if exists but insert if not
-        match collection.find_one(filter.clone()) {
-            Ok(Some(_)) => {
-                // Record exists, update it
-                collection
-                    .update_one(filter, doc)
-                    .map_err(|e| format!("Failed to update record: {}", e))?;
-            }
-            Ok(None) => {
-                // Record doesn't exist, insert it
-                collection
-                    .insert_one(doc)
-                    .map_err(|e| format!("Failed to insert record: {}", e))?;
-            }
-            Err(e) => return Err(format!("Database error: {}", e)),
-        }
-
-        Ok(())
-    })
-}
-
-// helper to convert RawRecord to Document
-fn record_to_document(record: &RawRecord) -> Result<Document, String> {
+// helper to convert RawRecord to LocalDBEntry
+fn record_to_local_db_entry(record: &RawRecord) -> LocalDBEntry {
     let current_timestamp = timestamp();
-    let mut doc = doc! {
-        "id": &record.id,
-        "created_at": record.created_at,
-        "updated_at": record.updated_at,
-        "local_server_created_at": current_timestamp,
-        "local_server_last_modified": current_timestamp
-    };
+    let mut data = HashMap::new();
 
     for (key, value) in &record.data {
-        // Convert serde_json::Value to BSON value
-        let bson_value = serde_json_to_bson_value(value)
-            .map_err(|e| format!("Failed to convert field '{}': {}", key, e))?;
-
-        doc.insert(key, bson_value);
+        data.insert(key.clone(), value.clone());
     }
 
-    Ok(doc)
-}
-
-// TODO: move into separate module
-fn serde_json_to_bson_value(value: &serde_json::Value) -> Result<polodb_core::bson::Bson, String> {
-    match value {
-        serde_json::Value::Null => Ok(polodb_core::bson::Bson::Null),
-        serde_json::Value::Bool(b) => Ok(polodb_core::bson::Bson::Boolean(*b)),
-        serde_json::Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                Ok(polodb_core::bson::Bson::Int64(i))
-            } else if let Some(f) = n.as_f64() {
-                Ok(polodb_core::bson::Bson::Double(f))
-            } else {
-                Err("Unsupported number type".to_string())
-            }
-        }
-        serde_json::Value::String(s) => Ok(polodb_core::bson::Bson::String(s.clone())),
-        serde_json::Value::Array(arr) => {
-            let bson_array = arr
-                .iter()
-                .map(serde_json_to_bson_value)
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(polodb_core::bson::Bson::Array(bson_array))
-        }
-        serde_json::Value::Object(obj) => {
-            let mut doc = Document::new();
-            for (k, v) in obj {
-                doc.insert(k, serde_json_to_bson_value(v)?);
-            }
-            Ok(polodb_core::bson::Bson::Document(doc))
-        }
+    LocalDBEntry {
+        id: record.id.clone(),
+        created_at: record.created_at,
+        updated_at: record.updated_at,
+        local_server_created_at: current_timestamp,
+        local_server_last_modified: current_timestamp,
+        data,
     }
 }
 
@@ -335,6 +402,8 @@ async fn start_server(
     ip_address: IpAddr,
     shutdown_token: Arc<tokio::sync::Notify>,
 ) -> Result<(), String> {
+    // init_db().await;
+
     let app = Route::new()
         .at("/", get(index_route))
         .at("/hello/:name", get(hello))
@@ -350,13 +419,6 @@ async fn start_server(
 
     // Run the server with graceful shutdown
     let server_future = Server::new(TcpListener::bind(bind_address)).run(app);
-
-    // Get count of patients in the database
-    let patients_collection = DB.collection::<Document>("patients");
-    match patients_collection.count_documents() {
-        Ok(count) => println!("Number of patients in database: {}", count),
-        Err(e) => println!("Error counting patients: {}", e),
-    }
 
     // Race between the server and the shutdown signal
     match tokio::select! {
@@ -374,19 +436,47 @@ async fn start_server(
     }
 }
 
+async fn init_db() {
+    let db_url = db::get_database();
+    db::create(&db_url).await;
+
+    println!("Database created at: {}", db_url);
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // TODO: this must be changed
+    let db_url = db::get_database();
+    // std::fs::write("hikma-health.db", b"").ok();
+
+
+    // sqlx::sqlite::SqlitePool::mi(&db_url).await.unwrap();
+
+
     // Initialize with server state
     tauri::Builder::default()
+        .plugin(
+            tauri_plugin_sql::Builder::default()
+                // Manually create the Vec<Migration> since Migration is not Clone
+                .add_migrations(
+                    &db_url,
+                    HH_MIGRATIONS
+                        .iter()
+                        .map(|m| Migration {
+                            version: m.version,
+                            description: m.description,
+                            sql: m.sql,
+                            kind: match m.kind {
+                                MigrationKind::Up => MigrationKind::Up,
+                                MigrationKind::Down => MigrationKind::Down,
+                            },
+                        })
+                        .collect(),
+                )
+                .build(),
+        )
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_opener::init())
-        .setup(|app| {
-            // allowed the given directory
-            let scope = app.fs_scope();
-            scope.allow_directory("/path/to/directory", false);
-
-            Ok(())
-        })
         .manage(ServerState::default())
         // .manage(DB.clone())
         .invoke_handler(tauri::generate_handler![
