@@ -12,6 +12,7 @@ use poem::{
 use serde::{Deserialize, Serialize};
 use serde_json::{self, json};
 use sqlx::sqlite::SqlitePool;
+use sqlx::Row;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{collections::HashMap, net::IpAddr};
@@ -163,23 +164,197 @@ struct LocalDBEntry {
 //     "prescriptions",
 //   ]
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct GetSyncResponse {
+    changes: SyncDatabaseChangeSet,
+    timestamp: i64,
+}
+
 #[handler]
-fn get_sync(Query(params): Query<HashMap<String, String>>) -> Result<impl IntoResponse> {
-    // Extract lastPulledAt parameter using functional approach
-    params
+async fn get_sync(Query(params): Query<HashMap<String, String>>) -> Result<impl IntoResponse> {
+    println!("GET sync request: {:#?}", params);
+    let last_pulled_at = params
         .get("lastPulledAt")
-        .map(|timestamp| println!("GET sync request with lastPulledAt: {}", timestamp))
-        .unwrap_or_else(|| println!("GET sync request with no lastPulledAt parameter"));
+        .map(|timestamp| {
+            println!("GET sync request with lastPulledAt: {}", timestamp);
+            timestamp.parse::<i64>().unwrap_or(0)
+        })
+        .unwrap_or_else(|| {
+            println!("GET sync request with no lastPulledAt parameter");
+            0
+        });
 
-    // Create empty response in a functional way
-    let changes: SyncDatabaseChangeSet = SyncDatabaseChangeSet(HashMap::new());
+    // Get database connection
+    let db_url = db::get_database();
 
-    println!(
-        "GET sync response: {}",
-        serde_json::to_string_pretty(&changes)
-            .unwrap_or_else(|_| "Failed to serialize changes".to_string())
-    );
-    Ok(Json(changes))
+    let db_pool = match SqlitePool::connect(&db_url).await {
+        Ok(pool) => pool,
+        Err(err) => return Err(InternalServerError(err)),
+    };
+
+    // Define the tables to query
+    let tables = vec![
+        "patients", "events", "visits", "clinics", "users", 
+        "event_forms", "registration_forms", "patient_additional_attributes", 
+        "appointments", "prescriptions"
+    ];
+
+    // Create a future for each table to query in parallel
+    let table_futures = tables
+        .into_iter()
+        .map(|table| {
+            let db_pool = db_pool.clone();
+            let table_name = table.to_string();
+            
+            async move {
+                // Create a new change set for this table
+                let mut table_changes = SyncTableChangeSet::new();
+                
+                // Query for new records (created after last sync)
+                let new_records_sql = format!(
+                    "SELECT id, data, local_server_created_at, local_server_last_modified FROM {} 
+                     WHERE local_server_created_at > ? 
+                     AND local_server_deleted_at IS NULL", 
+                    table_name
+                );
+                
+                let new_records_result = sqlx::query(&new_records_sql)
+                    .bind(last_pulled_at)
+                    .fetch_all(&db_pool)
+                    .await;
+                
+                if let Ok(rows) = new_records_result {
+                    let created_records = rows.into_iter()
+                        .filter_map(|row| {
+                            let id: String = row.get("id");
+                            let data_json: String = row.get("data");
+                            let created_at: i64 = row.get("local_server_created_at");
+                            let updated_at: i64 = row.get("local_server_last_modified");
+                            
+                            // Parse the JSON data
+                            match serde_json::from_str::<HashMap<String, serde_json::Value>>(&data_json) {
+                                Ok(mut data) => {
+                                    // Add the id to the data map
+                                    data.insert("id".to_string(), serde_json::Value::String(id.clone()));
+                                    
+                                    Some(RawRecord {
+                                        id,
+                                        created_at,
+                                        updated_at,
+                                        data,
+                                    })
+                                },
+                                Err(e) => {
+                                    eprintln!("Failed to parse JSON for record {}: {}", id, e);
+                                    None
+                                }
+                            }
+                        })
+                        .collect();
+                    
+                    table_changes.created = created_records;
+                }
+                
+                // Query for updated records (modified after last sync but created before)
+                let updated_records_sql = format!(
+                    "SELECT id, data, local_server_created_at, local_server_last_modified FROM {} 
+                     WHERE local_server_last_modified > ? 
+                     AND local_server_created_at <= ? 
+                     AND local_server_deleted_at IS NULL", 
+                    table_name
+                );
+                
+                let updated_records_result = sqlx::query(&updated_records_sql)
+                    .bind(last_pulled_at)
+                    .bind(last_pulled_at)
+                    .fetch_all(&db_pool)
+                    .await;
+                
+                if let Ok(rows) = updated_records_result {
+                    let updated_records = rows.into_iter()
+                        .filter_map(|row| {
+                            let id: String = row.get("id");
+                            let data_json: String = row.get("data");
+                            let created_at: i64 = row.get("local_server_created_at");
+                            let updated_at: i64 = row.get("local_server_last_modified");
+                            
+                            // Parse the JSON data
+                            match serde_json::from_str::<HashMap<String, serde_json::Value>>(&data_json) {
+                                Ok(mut data) => {
+                                    // Add the id to the data map
+                                    data.insert("id".to_string(), serde_json::Value::String(id.clone()));
+                                    
+                                    Some(RawRecord {
+                                        id,
+                                        created_at,
+                                        updated_at,
+                                        data,
+                                    })
+                                },
+                                Err(e) => {
+                                    eprintln!("Failed to parse JSON for record {}: {}", id, e);
+                                    None
+                                }
+                            }
+                        })
+                        .collect();
+                    
+                    table_changes.updated = updated_records;
+                }
+                
+                // Query for deleted records
+                let deleted_records_sql = format!(
+                    "SELECT id FROM {} WHERE local_server_deleted_at > ?", 
+                    table_name
+                );
+                
+                let deleted_records_result = sqlx::query(&deleted_records_sql)
+                    .bind(last_pulled_at)
+                    .fetch_all(&db_pool)
+                    .await;
+                
+                if let Ok(rows) = deleted_records_result {
+                    let deleted_ids = rows.into_iter()
+                        .map(|row| row.get::<String, _>("id"))
+                        .collect();
+                    
+                    table_changes.deleted = deleted_ids;
+                }
+
+                // Return the table name and changes as a Result
+                // This makes it compatible with try_join_all
+                Ok::<_, poem::Error>((table_name, table_changes))
+                
+                // // Return the table name and changes if there are any
+                // if !table_changes.is_empty() {
+                //     Some((table_name, table_changes))
+                // } else {
+                //     None
+                // }
+            }
+        })
+        .collect::<Vec<_>>();
+
+     // Execute all futures in parallel and collect the results
+     let table_results = try_join_all(table_futures).await?;
+    
+     // Create the database change set from the results using functional approach
+     let mut changes = SyncDatabaseChangeSet::new();
+ 
+     // Add each table's changes to the database change set if not empty
+     table_results.into_iter()
+         .filter(|(_, table_changes)| !table_changes.is_empty())
+         .for_each(|(table_name, table_changes)| {
+             changes.add_table_changes(&table_name, table_changes);
+         });
+ 
+     println!(
+         "GET sync response: {}",
+         serde_json::to_string_pretty(&changes)
+             .unwrap_or_else(|_| "Failed to serialize changes".to_string())
+     );
+    
+    Ok(Json(GetSyncResponse { changes, timestamp: timestamp() }))
 }
 
 #[handler]
@@ -204,7 +379,7 @@ async fn post_sync(
 
     let db_url = db::get_database();
 
-    println!("Database URL: {}", db_url);
+    let ignored_tables = vec!["users".to_string(), "registration_forms".to_string(), "event_forms".to_string()];
 
     let db_pool = match SqlitePool::connect(&db_url).await {
         Ok(pool) => pool,
@@ -214,13 +389,15 @@ async fn post_sync(
     let table_futures = body
         .0
         .iter()
+        .filter(|(table, _)| !ignored_tables.contains(table))
         .map(|(table, changeset)| {
             let table = table.clone();
             let db_pool = db_pool.clone();
             
             async move {
                 println!("Table: {}", table);
-                println!("Updated: {:#?}", changeset.updated);
+                println!("Created: {:#?}", changeset.created.len());
+                println!("Updated: {:#?}", changeset.updated.len());
 
                 // If there are records in the created field, join them with the updated records
                 let updated_records = changeset
@@ -283,33 +460,34 @@ async fn post_sync(
                 // Process deletes (soft delete)
                 let current_time = timestamp(); // Get timestamp once for all deletions in this table
                 for deleted_id in &changeset.deleted {
-                    // Construct the dynamic SQL query for soft delete
-                    let sql_delete = format!(
+                    // Use a single upsert statement to either create a new record marked as deleted
+                    // or update an existing record to mark it as deleted
+                    let sql_upsert_delete = format!(
                         r#"
-                         UPDATE "{}"
-                         SET
-                             local_server_last_modified = ?,
-                             local_server_deleted_at = ?
-                         WHERE id = ? AND local_server_deleted_at IS NULL;
-                         "#,
+                        INSERT INTO "{}" (id, data, local_server_created_at, local_server_last_modified, local_server_deleted_at)
+                        VALUES (?, '{{}}', ?, ?, ?)
+                        ON CONFLICT(id) DO UPDATE SET
+                            local_server_last_modified = excluded.local_server_last_modified,
+                            local_server_deleted_at = COALESCE(
+                                "{0}".local_server_deleted_at, 
+                                excluded.local_server_deleted_at
+                            );
+                        "#,
                         table
                     );
 
-                    // Block on the async execution for simplicity
                     let delete_result = 
-                        sqlx::query(&sql_delete)
-                            .bind(current_time)
-                            .bind(current_time) // Set deleted_at to the same timestamp
+                        sqlx::query(&sql_upsert_delete)
                             .bind(deleted_id)
+                            .bind(current_time)
+                            .bind(current_time)
+                            .bind(current_time)
                             .execute(&db_pool)
                             .await;
 
                      match delete_result {
-                         Ok(result) => {
-                             if result.rows_affected() == 0 {
-                                // Optionally log if the record wasn't found or was already deleted
-                                println!("Record with ID {} in table {} not found for deletion or already deleted.", deleted_id, table);
-                             }
+                         Ok(_) => {
+                             // Successfully marked as deleted (either new or existing record)
                          }
                          Err(e) => {
                              // Log the error and return an error to stop processing this table
@@ -440,18 +618,31 @@ async fn init_db() {
     let db_url = db::get_database();
     db::create(&db_url).await;
 
+    db::migrate(&db_url).await;
+
     println!("Database created at: {}", db_url);
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // TODO: this must be changed
-    let db_url = db::get_database();
+    // let db_url = db::get_database();
+    let db_url = "sqlite:hikma-health.db";
     // std::fs::write("hikma-health.db", b"").ok();
 
 
     // sqlx::sqlite::SqlitePool::mi(&db_url).await.unwrap();
 
+
+    let migrations = HH_MIGRATIONS.iter().map(|m| Migration {
+        version: m.version,
+        description: m.description,
+        sql: m.sql,
+        kind: match m.kind {
+            MigrationKind::Up => MigrationKind::Up,
+            MigrationKind::Down => MigrationKind::Down,
+        },
+    }).collect();
 
     // Initialize with server state
     tauri::Builder::default()
@@ -460,18 +651,7 @@ pub fn run() {
                 // Manually create the Vec<Migration> since Migration is not Clone
                 .add_migrations(
                     &db_url,
-                    HH_MIGRATIONS
-                        .iter()
-                        .map(|m| Migration {
-                            version: m.version,
-                            description: m.description,
-                            sql: m.sql,
-                            kind: match m.kind {
-                                MigrationKind::Up => MigrationKind::Up,
-                                MigrationKind::Down => MigrationKind::Down,
-                            },
-                        })
-                        .collect(),
+                    migrations,
                 )
                 .build(),
         )
@@ -517,7 +697,9 @@ fn get_server_status(state: tauri::State<ServerState>) -> Result<(bool, Option<S
 
 // Start server command - more functional with less mutable state
 #[tauri::command]
-fn start_server_command(state: tauri::State<ServerState>) -> Result<String, String> {
+async fn start_server_command<'a>(state: tauri::State<'a, ServerState>) -> Result<String, String> {
+    init_db().await;
+
     // Check if already running using atomic boolean
     if state.is_running.load(std::sync::atomic::Ordering::Relaxed) {
         return Err("Server is already running".to_string());

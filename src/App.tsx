@@ -1,5 +1,7 @@
 import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import Database from "@tauri-apps/plugin-sql";
+
 import "./App.css";
 import QRCode from "qrcode.react";
 
@@ -14,8 +16,20 @@ function App() {
   const [statusMessage, setStatusMessage] = useState<string>("");
   const [error, setError] = useState<string | null>(null);
 
+  const loadDb = async () => {
+    await Database.load("sqlite:hikma-health.db");
+  };
+
   // Get server status on component mount
   useEffect(() => {
+    // on mount, also init the database:
+    loadDb()
+      .then(() => {
+        console.log("Database loaded successfully");
+      })
+      .catch((err) => {
+        alert(`Failed to load database: ${err}`);
+      });
     checkServerStatus();
   }, []);
 

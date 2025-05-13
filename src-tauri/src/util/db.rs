@@ -2,13 +2,23 @@ use std::env;
 use std::io;
 use std::path::PathBuf;
 
-use sqlx::{migrate::MigrateDatabase, Sqlite};
+use sqlx::migrate::Migrator;
+use sqlx::{migrate::MigrateDatabase, Sqlite, SqlitePool};
 
 fn get_database_path() -> io::Result<PathBuf> {
     let mut exe = env::current_exe()?;
-    exe.set_file_name("./hikma-health.db");
+    // exe.set_file_name("./hikma-health.db");
+    exe.set_file_name("sqlite:hikma-health.db");
     #[cfg(dev)]
-    exe.set_file_name("../../hikma-health.db");
+    exe.set_file_name("sqlite:hikma-health.db");
+    Ok(exe)
+}
+
+fn get_migrations_path() -> io::Result<PathBuf> {
+    let mut exe = env::current_exe()?;
+    exe.set_file_name("./migrations");
+    #[cfg(dev)]
+    exe.set_file_name("../../migrations");
     Ok(exe)
 }
 
@@ -22,6 +32,15 @@ pub async fn create(db_url: &str) {
     } else {
         println!("Database already exists");
     }
+}
+
+pub async fn migrate(db_url: &str) -> Result<(), sqlx::Error> {
+    let pool = SqlitePool::connect(db_url).await?;
+    let migrations_path = get_migrations_path().unwrap();
+
+    let m = Migrator::new(migrations_path).await?;
+    m.run(&pool).await?;
+    Ok(())
 }
 
 pub fn get_database() -> String {
