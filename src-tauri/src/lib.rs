@@ -4,18 +4,19 @@ use once_cell::sync::Lazy;
 use poem::{
     error::{ExpectationFailed, InternalServerError},
     get, handler,
-    listener::TcpListener,
+    listener::{Listener, RustlsCertificate, RustlsConfig, TcpListener},
     post,
     web::{Json, Path, Query},
     IntoResponse, Result, Route, Server,
 };
+use rcgen::{generate_simple_self_signed, CertifiedKey};
 use serde::{Deserialize, Serialize};
 use serde_json::{self, json};
 use sqlx::sqlite::SqlitePool;
 use sqlx::Row;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use std::{collections::HashMap, net::IpAddr};
+use std::{collections::HashMap, net::IpAddr, path::PathBuf, io::BufReader, fs::File};
 use tauri::State;
 use tauri_plugin_fs::FsExt;
 use tauri_plugin_sql::{Builder, DbInstances, DbPool, Migration, MigrationKind};
@@ -41,6 +42,7 @@ fn hello(Path(name): Path<String>) -> String {
 
 #[handler]
 fn index_route() -> String {
+    println!("Index route accessed");
     "Hello hikma health local server.".to_string()
 }
 
@@ -554,18 +556,31 @@ fn record_to_local_db_entry(record: &RawRecord) -> LocalDBEntry {
     let current_timestamp = timestamp();
     let mut data = HashMap::new();
 
+    // Copy all existing data fields
     for (key, value) in &record.data {
         data.insert(key.clone(), value.clone());
     }
 
-    LocalDBEntry {
+    // Ensure id, created_at, and updated_at are also present in the data field
+    data.insert("id".to_string(), serde_json::Value::String(record.id.clone()));
+    data.insert("created_at".to_string(), serde_json::Value::Number(
+        serde_json::Number::from(record.created_at)
+    ));
+    data.insert("updated_at".to_string(), serde_json::Value::Number(
+        serde_json::Number::from(record.updated_at)
+    ));
+
+    let local_db_entry = LocalDBEntry {
         id: record.id.clone(),
         created_at: record.created_at,
         updated_at: record.updated_at,
         local_server_created_at: current_timestamp,
         local_server_last_modified: current_timestamp,
         data,
-    }
+    };
+    println!("LocalDBEntry: {:#?}", local_db_entry);
+    println!("Record: {:#?}", record);
+    local_db_entry
 }
 
 // Get current timestamp in milliseconds (Unix epoch)
@@ -576,6 +591,75 @@ fn timestamp() -> i64 {
         .unwrap_or(0)
 }
 
+// #[tauri::command]
+// async fn generate_self_signed_cert<'a>(
+//     app_handle: tauri::AppHandle,
+// ) -> Result<String, String> {
+//     // Get app directory for certificate storage
+//     let app_dir = app_handle.path_resolver()
+//         .app_dir()
+//         .ok_or_else(|| "Failed to get app directory".to_string())?;
+    
+//     // Create certs directory if it doesn't exist
+//     let cert_dir = app_dir.join("certs");
+//     if !cert_dir.exists() {
+//         tokio::fs::create_dir_all(&cert_dir)
+//             .await
+//             .map_err(|e| format!("Failed to create certs directory: {}", e))?;
+//     }
+    
+//     let cert_path = cert_dir.join("server.crt");
+//     let key_path = cert_dir.join("server.key");
+    
+//     // Check if certificates already exist
+//     if cert_path.exists() && key_path.exists() {
+//         return Ok("Certificates already exist".to_string());
+//     }
+    
+//     // Generate self-signed certificate using openssl command
+//     // This is for development/testing purposes only
+//     let output = std::process::Command::new("openssl")
+//         .args([
+//             "req", "-x509", "-newkey", "rsa:4096", 
+//             "-keyout", key_path.to_str().unwrap(), 
+//             "-out", cert_path.to_str().unwrap(),
+//             "-days", "365", "-nodes", "-subj", "/CN=localhost"
+//         ])
+//         .output()
+//         .map_err(|e| format!("Failed to execute openssl command: {}", e))?;
+    
+//     if !output.status.success() {
+//         let error = String::from_utf8_lossy(&output.stderr);
+//         return Err(format!("OpenSSL command failed: {}", error));
+//     }
+    
+//     Ok(format!(
+//         "Generated self-signed certificates at:\n- Certificate: {:?}\n- Key: {:?}",
+//         cert_path, key_path
+//     ))
+// }
+
+
+// Function to load SSL certificates for HTTPS
+// async fn load_certificates(cert_path: &str, key_path: &str) -> std::result::Result<TlsConfig, String> {
+//     // Load TLS certificate and key files
+//     let cert_file = tokio::fs::read(cert_path)
+//         .await
+//         .map_err(|e| format!("Failed to read certificate file: {}", e))?;
+    
+//     let key_file = tokio::fs::read(key_path)
+//         .await
+//         .map_err(|e| format!("Failed to read key file: {}", e))?;
+    
+//     // Create TLS configuration
+//     TlsConfig::new()
+//         .cert(cert_file)
+//         .key(key_file)
+//         .map_err(|e| format!("Failed to create TLS config: {}", e))
+// }
+
+
+// TODO: cycle the certificate generation
 async fn start_server(
     ip_address: IpAddr,
     shutdown_token: Arc<tokio::sync::Notify>,
@@ -592,11 +676,77 @@ async fn start_server(
     println!("Starting server on all interfaces at port 3000");
     println!("Server should be accessible at: http://{}:3000", ip_address);
 
+    let exe_path = std::env::current_exe().unwrap();
+    let mut exe_path = exe_path.parent().unwrap().to_path_buf();
+    exe_path.push("certs");
+
+    // Create certs directory if it doesn't exist
+    if !exe_path.exists() {
+        std::fs::create_dir_all(&exe_path)
+            .map_err(|e| format!("Failed to create certs directory: {}", e))?;
+    }
+
+    let cert_path = exe_path.join("server.crt");
+    let key_path = exe_path.join("server.key");
+
+    // Generate certificates if they don't exist
+    if !cert_path.exists() || !key_path.exists() {
+        println!("Generating self-signed certificates...");
+        // Generate self-signed certificate with localhost and IP as subject alternative names
+        let subject_alt_names = vec![
+            ip_address.to_string(),
+            "localhost".to_string()
+        ];
+        
+        let certified_key = generate_simple_self_signed(subject_alt_names)
+            .map_err(|e| format!("Failed to generate certificate: {}", e))?;
+        
+        // Write certificate and key to files
+        std::fs::write(&cert_path, certified_key.cert.pem())
+            .map_err(|e| format!("Failed to write certificate file: {}", e))?;
+        
+        std::fs::write(&key_path, certified_key.key_pair.serialize_pem())
+            .map_err(|e| format!("Failed to write key file: {}", e))?;
+        
+        println!("Generated certificates at: {:?} and {:?}", cert_path, key_path);
+    }
+
     // Create a future that completes when the shutdown signal is received
     let shutdown_future = shutdown_token.notified();
 
-    // Run the server with graceful shutdown
-    let server_future = Server::new(TcpListener::bind(bind_address)).run(app);
+    // Run the server with the appropriate listener based on certificate availability
+    // Self signed certificates are causing trouble with ios and android security rules. Leaving out until a better solution comes up
+    // TODO: Consider an alternative where where we just encrypt and decrypt the data on our own.
+    let _listener = if cert_path.exists() && key_path.exists() {
+        println!("Starting HTTPS server on all interfaces at port 3000");
+        println!("Server should be accessible at: https://{}", ip_address);
+        
+        // Load certificates
+        let cert_file = tokio::fs::read(cert_path)
+            .await
+            .map_err(|e| format!("Failed to read certificate file: {}", e))?;
+        
+        let key_file = tokio::fs::read(key_path)
+            .await
+            .map_err(|e| format!("Failed to read key file: {}", e))?;
+        
+        // Create TLS listener
+        TcpListener::bind(bind_address)
+            .rustls(RustlsConfig::new().fallback(RustlsCertificate::new().key(key_file).cert(cert_file)))
+    } else {
+        println!("Starting HTTP server on all interfaces at port 3000");
+        println!("Server should be accessible at: http://{}", ip_address);
+        // println!("HTTPS not available: certificates not found at {:?} and {:?}", cert_path, key_path);
+        
+        // Create plain TCP listener
+        TcpListener::bind(bind_address).rustls(RustlsConfig::default())
+    };
+
+    // The listener without certificates - using this one until we can figure out how to get certificates signed by a central authority (CA)
+    let no_cert_listener = TcpListener::bind(bind_address);
+    
+    // Run the server with the selected listener type
+    let server_future = Server::new(no_cert_listener).run(app);
 
     // Race between the server and the shutdown signal
     match tokio::select! {
@@ -663,8 +813,13 @@ pub fn run() {
             greet,
             start_server_command,
             stop_server_command,
-            get_server_status
+            get_server_status,
+            // generate_self_signed_cert
         ])
+        // .setup(|app| {
+        //     // Generate self-signed certificate
+            
+        // })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

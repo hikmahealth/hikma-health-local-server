@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "hikma-health-local-server",
+  "productName": "Hikma Health Local Server",
   "version": "0.1.0",
   "identifier": "com.hikma-health-local-server.app",
   "build": {
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "hikma-health-local-server",
+        "title": "Hikma Health Local Server",
         "width": 800,
         "height": 600
       }

@@ -112,13 +112,12 @@ function App() {
       {serverStatus.address && (
         <div className="qr-container">
           <h2>Server Address</h2>
-          <p>{serverStatus.address}</p>
-          <div className="qr-code">
-            <QRCode value={serverStatus.address} size={256} />
-          </div>
           <p className="help-text">
             Scan this QR code with your mobile device to connect to the server
           </p>
+          <div className="qr-code">
+            <QRCode value={serverStatus.address} size={256} />
+          </div>
         </div>
       )}
     </main>
